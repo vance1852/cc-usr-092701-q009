@@ -37,11 +37,13 @@ class Careflow:
         from .exports import PatientExportService
         from .milestones import MilestoneService
         from .clinical_flags import ClinicalFlagService
+        from .entitlements import EntitlementService
         self.supplies = SupplyService(self.db, self.clock)
         self.reports = ReportService(self.db, self.clock)
         self.exports = PatientExportService(self.db, self.clock)
         self.milestones = MilestoneService(self.db, self.clock)
         self.clinical_flags = ClinicalFlagService(self.db, self.clock)
+        self.entitlements = EntitlementService(self.db, self.clock)
 
     def now(self) -> str:
         return timestamp(self.clock.now())
@@ -615,6 +617,12 @@ class Careflow:
                 encounter_id = new_id("enc")
                 connection.execute("INSERT INTO encounters(id,appointment_id,patient_id,clinic_id,state,opened_by,opened_at) VALUES(?,?,?,?,'open',?,?)",
                                    (encounter_id, appointment_id, appointment["patient_id"], clinic_id, actor_id, now))
+            if action == "cancel":
+                self.entitlements.release_for_appointment(connection, clinic_id, appointment_id,
+                                                          "预约取消，占用次数返还", now, actor_id)
+            elif action == "no_show":
+                self.entitlements.review_for_appointment(connection, clinic_id, appointment_id,
+                                                         "患者未到诊，占用次数待财务复核", now, actor_id)
             audit.append_event(connection, clinic_id=clinic_id, actor_id=actor_id, patient_id=appointment["patient_id"],
                                aggregate_type="appointment", aggregate_id=appointment_id, action=f"appointment.{action}",
                                occurred_at=now, payload={"from": appointment["state"], "to": after, "reason": reason, "version": version})
@@ -743,6 +751,8 @@ class Careflow:
                 (clinic_id, now, limit)).fetchall()
             for row in rows:
                 connection.execute("UPDATE appointments SET state='cancelled',version=version+1 WHERE id=? AND state='held'", (row["id"],))
+                self.entitlements.release_for_appointment(connection, clinic_id, row["id"],
+                                                          "预约占位过期，占用次数返还", now, None)
                 audit.append_event(connection, clinic_id=clinic_id, actor_id=None, patient_id=row["patient_id"],
                                    aggregate_type="appointment", aggregate_id=row["id"], action="appointment.hold_expired",
                                    occurred_at=now, payload={"hold_expires_at": row["hold_expires_at"]})

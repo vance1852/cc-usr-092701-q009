@@ -11,7 +11,7 @@ from typing import Iterator
 
 from .errors import StorageFailure
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -347,6 +347,75 @@ CREATE TABLE IF NOT EXISTS incident_events (
     sequence INTEGER NOT NULL,
     UNIQUE(incident_id,sequence)
 );
+CREATE TABLE IF NOT EXISTS entitlement_grants (
+    id TEXT PRIMARY KEY,
+    clinic_id TEXT NOT NULL REFERENCES clinics(id),
+    patient_id TEXT NOT NULL REFERENCES patients(id),
+    item_code TEXT NOT NULL,
+    source_type TEXT NOT NULL CHECK(source_type IN ('purchase','gift','transfer_in')),
+    source_ref TEXT NOT NULL,
+    total_sessions INTEGER NOT NULL CHECK(total_sessions > 0),
+    scope_json TEXT NOT NULL,
+    valid_from TEXT NOT NULL,
+    valid_until TEXT,
+    rule_version INTEGER NOT NULL CHECK(rule_version >= 1),
+    state TEXT NOT NULL CHECK(state IN ('active','exhausted','expired','void')),
+    created_by TEXT NOT NULL REFERENCES staff(id),
+    created_at TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS entitlement_grants_patient ON entitlement_grants(patient_id,item_code,state,valid_until);
+CREATE TABLE IF NOT EXISTS entitlement_reservations (
+    id TEXT PRIMARY KEY,
+    clinic_id TEXT NOT NULL REFERENCES clinics(id),
+    grant_id TEXT NOT NULL REFERENCES entitlement_grants(id),
+    patient_id TEXT NOT NULL REFERENCES patients(id),
+    appointment_id TEXT NOT NULL REFERENCES appointments(id),
+    sessions INTEGER NOT NULL CHECK(sessions > 0),
+    consumed_sessions INTEGER NOT NULL DEFAULT 0 CHECK(consumed_sessions >= 0),
+    state TEXT NOT NULL CHECK(state IN ('reserved','released','consumed','pending_review','review_released','review_deducted')),
+    idempotency_key TEXT NOT NULL UNIQUE,
+    reserved_by TEXT NOT NULL REFERENCES staff(id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS entitlement_resv_grant ON entitlement_reservations(grant_id,state);
+CREATE INDEX IF NOT EXISTS entitlement_resv_appointment ON entitlement_reservations(appointment_id,state);
+CREATE TABLE IF NOT EXISTS entitlement_entries (
+    id TEXT PRIMARY KEY,
+    grant_id TEXT NOT NULL REFERENCES entitlement_grants(id),
+    clinic_id TEXT NOT NULL REFERENCES clinics(id),
+    patient_id TEXT NOT NULL REFERENCES patients(id),
+    item_code TEXT NOT NULL,
+    entry_type TEXT NOT NULL CHECK(entry_type IN ('grant','supplement','reserve','release','consume','expire','reverse','review_pending','review_release','review_deduct')),
+    sessions INTEGER NOT NULL CHECK(sessions > 0),
+    delta INTEGER NOT NULL CHECK(delta = -sessions OR delta = 0 OR delta = sessions),
+    appointment_id TEXT REFERENCES appointments(id),
+    reservation_id TEXT REFERENCES entitlement_reservations(id),
+    encounter_id TEXT REFERENCES encounters(id),
+    reverses TEXT REFERENCES entitlement_entries(id),
+    actor_id TEXT REFERENCES staff(id),
+    reason TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    UNIQUE(grant_id,sequence),
+    UNIQUE(grant_id,idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS entitlement_entries_patient ON entitlement_entries(patient_id,item_code,created_at);
+CREATE INDEX IF NOT EXISTS entitlement_entries_reverses ON entitlement_entries(reverses);
+CREATE TABLE IF NOT EXISTS entitlement_settlements (
+    id TEXT PRIMARY KEY,
+    clinic_id TEXT NOT NULL REFERENCES clinics(id),
+    period_start TEXT NOT NULL,
+    period_end TEXT NOT NULL,
+    note TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    closed_by TEXT NOT NULL REFERENCES staff(id),
+    closed_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS entitlement_settlements_clinic ON entitlement_settlements(clinic_id,period_end);
 CREATE TABLE IF NOT EXISTS idempotency (
     scope TEXT NOT NULL,
     key TEXT NOT NULL,

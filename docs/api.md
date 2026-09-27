@@ -27,6 +27,19 @@
 
 随访和计划节点支持领取租约、版本校验、幂等创建、延期和完整处置历史。旧领取者不能以过期令牌提交结果；重新领取不会删除前次领取事件。
 
+## 次数权益台账
+
+- `POST /patients/{patient_id}/entitlements` 按患者与项目发放购买、赠送或转入额度，记录来源单号、适用范围、有效期与规则版本，需要 `Idempotency-Key`。
+- `POST /entitlements/reserve` 预约确认时按先到期先出占用次数；过期或未生效的额度不能被新预约占用，余额不足时整笔回滚。
+- `POST /entitlement-reservations/{id}/consume` 服务签署后按实际完成内容核销；部分履约必须声明剩余次数返还（`remainder=release`）或转财务复核（`remainder=review`）。
+- `POST /entitlement-reservations/{id}/release` 释放待履约占用并返还次数；预约取消或占位过期会自动返还，患者未到诊会自动转为待财务复核。
+- `POST /entitlement-reservations/{id}/resolve` 负责人复核待决次数，决定返还（`release`）或扣减（`deduct`）并记录理由。
+- `POST /entitlement-grants/{id}/supplement` 与 `POST /entitlement-entries/{id}/reverse` 为补录与冲正，均需书面理由且仅限负责人岗位；冲正以新分录落在当前期间，不回写已结账期间。
+- `GET /patients/{patient_id}/entitlements` 与 `GET /patients/{patient_id}/entitlement-ledger` 供前台与财务查看同一余额，并可追溯每次发放、预留、使用与返还的来源单号、预约、就诊与操作人。
+- `POST /entitlements/settlements` 月末结账：存在待复核次数时拒绝结账，期间不得与已有结账重叠；结账快照不可修改。`GET /entitlements/settlements` 与 `GET /entitlements/settlements/{id}` 供财务岗位查阅。
+
+台账分录只追加不修改，余额由分录求和得出；已结账记录不会被后台直接改数，更正一律通过补录或冲正分录并保留操作人与理由。
+
 ## 诊所耗材
 
 - `POST /products` 登记耗材；`POST /products/{product_id}/lots` 按批号入库。
@@ -49,3 +62,4 @@
 - 预约：占位 → 确认 → 到诊 → 服务中 → 完成；取消和未到诊是独立终态。
 - 不良事件：已报告 → 分诊 → 观察 → 已解决 → 关闭。每次处置单独记录操作人和理由。
 - 耗材预留：预留 → 释放或核销。库存数量由收货、预留、释放和更正流水求和，不直接改写历史数量。
+- 权益占用：预留 → 释放、核销或待财务复核；待复核由负责人决定返还或扣减。发放额度：生效 → 用尽、过期或作废。

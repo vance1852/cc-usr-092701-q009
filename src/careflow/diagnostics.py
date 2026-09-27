@@ -6,6 +6,7 @@ from collections import Counter
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from . import audit
 
@@ -50,6 +51,7 @@ class ConsistencyChecker:
         self.check_incident_ledger()
         self.check_signed_records()
         self.check_duplicate_active_reservations()
+        self.check_entitlement_ledger()
         chain = audit.verify_chain(self.connection, self.clinic_id)
         if not chain["ok"]:
             self.add("audit.chain_mismatch", "critical", "clinic", self.clinic_id,
@@ -219,6 +221,50 @@ class ConsistencyChecker:
                      {"appointments": [row["first_id"], row["second_id"]],
                       "intervals": [[row["starts_at"], row["first_end"]], [row["second_start"], row["second_end"]]]},
                      "联系诊所排班负责人核对是否为合法协同服务或重复占用。")
+
+    def check_entitlement_ledger(self) -> None:
+        rows = self.connection.execute(
+            "SELECT r.id,r.patient_id,r.appointment_id,r.sessions,a.state AS appointment_state "
+            "FROM entitlement_reservations r JOIN appointments a ON a.id=r.appointment_id "
+            "WHERE r.clinic_id=? AND r.state='reserved' AND a.state IN ('completed','cancelled','no_show') ORDER BY r.id",
+            (self.clinic_id,)).fetchall()
+        for row in rows:
+            self.add("entitlement.reservation.unresolved", "medium", "entitlement_reservation", row["id"],
+                     {"patient_id": row["patient_id"], "appointment_id": row["appointment_id"],
+                      "appointment_state": row["appointment_state"], "sessions": row["sessions"]},
+                     "核实履约情况后核销或释放占用次数，不要长期挂账。")
+        cutoff = (datetime.fromisoformat(self.as_of.replace("Z", "+00:00")) - timedelta(hours=72)
+                  ).isoformat(timespec="seconds").replace("+00:00", "Z")
+        rows = self.connection.execute(
+            "SELECT id,patient_id,sessions,consumed_sessions,updated_at FROM entitlement_reservations "
+            "WHERE clinic_id=? AND state='pending_review' AND updated_at<=? ORDER BY updated_at,id",
+            (self.clinic_id, cutoff)).fetchall()
+        for row in rows:
+            self.add("entitlement.review_aging", "medium", "entitlement_reservation", row["id"],
+                     {"patient_id": row["patient_id"], "review_sessions": row["sessions"] - row["consumed_sessions"],
+                      "updated_at": row["updated_at"]},
+                     "财务尽快完成复核并记录扣减或返还理由。")
+        rows = self.connection.execute(
+            "SELECT e.id,e.grant_id,e.patient_id,e.sessions,e.encounter_id FROM entitlement_entries e "
+            "JOIN encounters x ON x.id=e.encounter_id WHERE e.clinic_id=? AND e.entry_type='consume' AND x.state='void' "
+            "ORDER BY e.id", (self.clinic_id,)).fetchall()
+        for row in rows:
+            self.add("entitlement.consume.void_encounter", "high", "entitlement_entry", row["id"],
+                     {"patient_id": row["patient_id"], "grant_id": row["grant_id"], "sessions": row["sessions"],
+                      "encounter_id": row["encounter_id"]},
+                     "就诊记录已作废但核销仍有效；由负责人冲正核销分录并说明理由。")
+        timezone = self.connection.execute("SELECT timezone FROM clinics WHERE id=?", (self.clinic_id,)).fetchone()["timezone"]
+        today = datetime.fromisoformat(self.as_of.replace("Z", "+00:00")).astimezone(ZoneInfo(timezone)).date().isoformat()
+        rows = self.connection.execute(
+            "SELECT g.id,g.patient_id,g.item_code,g.valid_until,COALESCE(SUM(e.delta),0) AS available "
+            "FROM entitlement_grants g LEFT JOIN entitlement_entries e ON e.grant_id=g.id "
+            "WHERE g.clinic_id=? AND g.state='active' AND g.valid_until IS NOT NULL AND g.valid_until<? "
+            "GROUP BY g.id HAVING available>0 ORDER BY g.valid_until,g.id", (self.clinic_id, today)).fetchall()
+        for row in rows:
+            self.add("entitlement.grant.expiry_pending", "low", "entitlement_grant", row["id"],
+                     {"patient_id": row["patient_id"], "item_code": row["item_code"],
+                      "valid_until": row["valid_until"], "available": row["available"]},
+                     "运行权益过期结转，将剩余次数从可用余额中核销。")
 
 
 def clinic_diagnostics(connection, clinic_id: str, as_of: str) -> dict[str, Any]:

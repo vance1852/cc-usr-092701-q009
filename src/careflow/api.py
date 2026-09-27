@@ -267,6 +267,58 @@ def create_handler(app: Careflow):
                                                      data.get("reason", "")), 200
             if self.command == "GET" and len(segments) == 3 and segments[0] == "stock" and segments[2] == "history":
                 return app.supplies.lot_history(clinic_id, actor_id, segments[1]), 200
+            if self.command == "POST" and len(segments) == 3 and segments[0] == "patients" and segments[2] == "entitlements":
+                data = self.body()
+                return app.entitlements.grant(clinic_id, actor_id, segments[1], data.get("item_code", ""),
+                                              data.get("sessions", 0), data.get("source_type", ""), data.get("source_ref", ""),
+                                              self.headers.get("Idempotency-Key", ""),
+                                              valid_from=data.get("valid_from"), valid_until=data.get("valid_until"),
+                                              rule_version=data.get("rule_version", 1), scope=data.get("scope")), 201
+            if self.command == "GET" and len(segments) == 3 and segments[0] == "patients" and segments[2] == "entitlements":
+                params = parse_qs(path.query)
+                return app.entitlements.balance(clinic_id, actor_id, segments[1],
+                                                item_code=params.get("item_code", [None])[0]), 200
+            if self.command == "GET" and len(segments) == 3 and segments[0] == "patients" and segments[2] == "entitlement-ledger":
+                params = parse_qs(path.query)
+                return {"items": app.entitlements.ledger(clinic_id, actor_id, segments[1],
+                                                         item_code=params.get("item_code", [None])[0],
+                                                         grant_id=params.get("grant_id", [None])[0])}, 200
+            if self.command == "POST" and segments == ["entitlements", "reserve"]:
+                data = self.body()
+                return app.entitlements.reserve(clinic_id, actor_id, data.get("appointment_id", ""),
+                                                data.get("item_code", ""), data.get("sessions", 0),
+                                                self.headers.get("Idempotency-Key", "")), 201
+            if self.command == "GET" and segments == ["entitlements", "reviews"]:
+                return {"items": app.entitlements.pending_reviews(clinic_id, actor_id)}, 200
+            if self.command == "POST" and segments == ["entitlements", "settlements"]:
+                data = self.body()
+                return app.entitlements.close_settlement(clinic_id, actor_id, data.get("period_start", ""),
+                                                         data.get("period_end", ""), data.get("note", ""),
+                                                         self.headers.get("Idempotency-Key", "")), 201
+            if self.command == "GET" and segments == ["entitlements", "settlements"]:
+                return {"items": app.entitlements.settlements(clinic_id, actor_id)}, 200
+            if self.command == "GET" and len(segments) == 3 and segments[0] == "entitlements" and segments[1] == "settlements":
+                return app.entitlements.settlement_detail(clinic_id, actor_id, segments[2]), 200
+            if self.command == "POST" and len(segments) == 3 and segments[0] == "entitlement-reservations" and segments[2] == "consume":
+                data = self.body()
+                return app.entitlements.consume(clinic_id, actor_id, segments[1], data.get("consumed_sessions", 0),
+                                                data.get("expected_version", 0), remainder=data.get("remainder")), 200
+            if self.command == "POST" and len(segments) == 3 and segments[0] == "entitlement-reservations" and segments[2] == "release":
+                data = self.body()
+                return app.entitlements.release(clinic_id, actor_id, segments[1], data.get("reason", ""),
+                                                data.get("expected_version", 0)), 200
+            if self.command == "POST" and len(segments) == 3 and segments[0] == "entitlement-reservations" and segments[2] == "resolve":
+                data = self.body()
+                return app.entitlements.resolve_review(clinic_id, actor_id, segments[1], data.get("action", ""),
+                                                       data.get("reason", ""), data.get("expected_version", 0)), 200
+            if self.command == "POST" and len(segments) == 3 and segments[0] == "entitlement-grants" and segments[2] == "supplement":
+                data = self.body()
+                return app.entitlements.supplement(clinic_id, actor_id, segments[1], data.get("sessions", 0),
+                                                   data.get("reason", ""), self.headers.get("Idempotency-Key", "")), 201
+            if self.command == "POST" and len(segments) == 3 and segments[0] == "entitlement-entries" and segments[2] == "reverse":
+                data = self.body()
+                return app.entitlements.reverse(clinic_id, actor_id, segments[1], data.get("reason", ""),
+                                                self.headers.get("Idempotency-Key", "")), 200
             if self.command == "GET" and len(segments) == 3 and segments[0] == "appointments" and segments[2] == "encounter":
                 return app.encounter_for_appointment(clinic_id, actor_id, segments[1]), 200
             if self.command == "POST" and len(segments) == 3 and segments[0] == "encounters" and segments[2] == "notes":
