@@ -50,6 +50,7 @@ class ConsistencyChecker:
         self.check_incident_ledger()
         self.check_signed_records()
         self.check_duplicate_active_reservations()
+        self.check_entitlement_invariants()
         chain = audit.verify_chain(self.connection, self.clinic_id)
         if not chain["ok"]:
             self.add("audit.chain_mismatch", "critical", "clinic", self.clinic_id,
@@ -204,6 +205,49 @@ class ConsistencyChecker:
             self.add("encounter.signature_mismatch", "high", "encounter", row["id"],
                      {"patient_id": row["patient_id"], "state": row["state"], "signed_by": row["signed_by"],
                       "signed_at": row["signed_at"], "version": row["version"]}, "保留就诊原文并由临床负责人复核签署凭据。")
+
+    def check_entitlement_invariants(self) -> None:
+        """核对权益台账的关键不变量；只报告证据，不自动改写。"""
+        # 1) 任何发放批次的流水合计都不能为负。
+        rows = self.connection.execute(
+            "SELECT g.id,g.patient_id,SUM(l.count_delta) AS balance "
+            "FROM entitlement_grants g JOIN entitlement_ledger l ON l.grant_id=g.id "
+            "WHERE g.clinic_id=? GROUP BY g.id HAVING balance<0 ORDER BY g.id",
+            (self.clinic_id,)).fetchall()
+        for row in rows:
+            self.add("entitlement.negative_balance", "critical", "entitlement_grant", row["id"],
+                     {"patient_id": row["patient_id"], "balance": row["balance"]},
+                     "冻结该批次权益并核对全部流水，禁止直接改数，按冲正流程处理。")
+        # 2) 已期满/停用批次不应仍有可占用余额。
+        rows = self.connection.execute(
+            "SELECT g.id,g.patient_id,g.state,SUM(l.count_delta) AS balance "
+            "FROM entitlement_grants g JOIN entitlement_ledger l ON l.grant_id=g.id "
+            "WHERE g.clinic_id=? AND g.state IN ('expired','revoked') GROUP BY g.id HAVING balance>0 "
+            "ORDER BY g.id", (self.clinic_id,)).fetchall()
+        for row in rows:
+            self.add("entitlement.expired_with_balance", "high", "entitlement_grant", row["id"],
+                     {"patient_id": row["patient_id"], "state": row["state"], "balance": row["balance"]},
+                     "核对停用或期满结转是否遗漏占用结算。")
+        # 3) 待财务复核流水必须仍能对应到有效预约与预留。
+        rows = self.connection.execute(
+            "SELECT l.sequence,l.patient_id,l.appointment_id,l.quantity FROM entitlement_ledger l "
+            "LEFT JOIN entitlement_ledger r ON r.resolves_review=l.id "
+            "WHERE l.clinic_id=? AND l.entry_type='review' AND r.id IS NULL "
+            "ORDER BY l.sequence", (self.clinic_id,)).fetchall()
+        for row in rows:
+            self.add("entitlement.review_pending", "medium", "entitlement_ledger", row["sequence"],
+                     {"patient_id": row["patient_id"], "appointment_id": row["appointment_id"],
+                      "quantity": row["quantity"]},
+                     "由财务核对未到诊或部分履约凭据后作出释放或扣减决定。")
+        # 4) 补录/冲正申请不应长期滞留待审。
+        rows = self.connection.execute(
+            "SELECT id,patient_id,kind,quantity,created_at FROM entitlement_adjustments "
+            "WHERE clinic_id=? AND state='pending' ORDER BY created_at,id", (self.clinic_id,)).fetchall()
+        for row in rows:
+            self.add("entitlement.adjustment_pending", "medium", "entitlement_adjustment", row["id"],
+                     {"patient_id": row["patient_id"], "kind": row["kind"], "quantity": row["quantity"],
+                      "created_at": row["created_at"]},
+                     "由非申请人的财务岗位尽快审批，驳回须填写意见。")
 
     def check_duplicate_active_reservations(self) -> None:
         rows = self.connection.execute(

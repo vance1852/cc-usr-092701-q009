@@ -37,11 +37,13 @@ class Careflow:
         from .exports import PatientExportService
         from .milestones import MilestoneService
         from .clinical_flags import ClinicalFlagService
+        from .entitlements import EntitlementService
         self.supplies = SupplyService(self.db, self.clock)
         self.reports = ReportService(self.db, self.clock)
         self.exports = PatientExportService(self.db, self.clock)
         self.milestones = MilestoneService(self.db, self.clock)
         self.clinical_flags = ClinicalFlagService(self.db, self.clock)
+        self.entitlements = EntitlementService(self.db, self.clock)
 
     def now(self) -> str:
         return timestamp(self.clock.now())
@@ -526,6 +528,7 @@ class Careflow:
     def create_appointment(self, clinic_id: str, actor_id: str, patient_id: str, kind: str,
                            starts_at: str, ends_at: str, idempotency_key: str, *,
                            staff_id: str | None = None, plan_id: str | None = None,
+                           service_code: str | None = None, service_quantity: int = 1,
                            hold_minutes: int = 10) -> dict[str, Any]:
         starts = timestamp(starts_at, "开始时间")
         ends = timestamp(ends_at, "结束时间")
@@ -535,10 +538,15 @@ class Careflow:
             raise ValidationError("不能预约已过去的时间")
         if not isinstance(hold_minutes, int) or not 1 <= hold_minutes <= 60:
             raise ValidationError("预约占位时间必须为 1 至 60 分钟")
+        if service_code is not None:
+            service_code = text(service_code, "服务项目编号", maximum=40)
+        if not isinstance(service_quantity, int) or isinstance(service_quantity, bool) or not 1 <= service_quantity <= 100:
+            raise ValidationError("服务数量必须为 1 至 100 的整数")
         key = require_idempotency_key(idempotency_key)
         kind = text(kind, "预约类型", maximum=100)
         body = {"clinic_id": clinic_id, "patient_id": patient_id, "kind": kind, "starts_at": starts,
-                "ends_at": ends, "staff_id": staff_id, "plan_id": plan_id}
+                "ends_at": ends, "staff_id": staff_id, "plan_id": plan_id,
+                "service_code": service_code, "service_quantity": service_quantity if service_code else 0}
         body_hash = request_digest(body)
         now = self.now()
         appointment_id = new_id("apt")
@@ -547,7 +555,7 @@ class Careflow:
             authorize(principal_for(connection, actor_id, clinic_id), "appointment:write", clinic_id=clinic_id)
             existing = connection.execute("SELECT * FROM appointments WHERE clinic_id=? AND idempotency_key=?", (clinic_id, key)).fetchone()
             if existing:
-                if existing["patient_id"] != patient_id or existing["starts_at"] != starts or existing["ends_at"] != ends or existing["kind"] != kind or existing["staff_id"] != staff_id or existing["plan_id"] != plan_id:
+                if existing["patient_id"] != patient_id or existing["starts_at"] != starts or existing["ends_at"] != ends or existing["kind"] != kind or existing["staff_id"] != staff_id or existing["plan_id"] != plan_id or existing["service_code"] != service_code or (existing["service_quantity"] or 0) != body["service_quantity"]:
                     raise Conflict("幂等编号已被不同预约内容使用")
                 return self._appointment_result(existing, replayed=True)
             patient = connection.execute("SELECT state FROM patients WHERE id=? AND clinic_id=?", (patient_id, clinic_id)).fetchone()
@@ -555,6 +563,10 @@ class Careflow:
                 raise NotFound("患者不存在")
             if patient["state"] != "active":
                 raise Conflict("非在诊患者不能预约")
+            if service_code and connection.execute(
+                "SELECT 1 FROM service_catalog WHERE clinic_id=? AND code=? AND active=1",
+                (clinic_id, service_code)).fetchone() is None:
+                raise NotFound(f"服务项目不存在或已停用：{service_code}")
             if staff_id:
                 staff = connection.execute("SELECT active FROM staff WHERE id=? AND clinic_id=?", (staff_id, clinic_id)).fetchone()
                 if staff is None or not staff["active"]:
@@ -570,9 +582,11 @@ class Careflow:
                 if plan is None or plan["patient_id"] != patient_id or plan["state"] not in {"proposed", "active"}:
                     raise Conflict("预约关联的计划不存在或当前不可履约")
             connection.execute(
-                "INSERT INTO appointments(id,clinic_id,patient_id,plan_id,staff_id,kind,starts_at,ends_at,state,hold_expires_at,idempotency_key,created_by,created_at) "
-                "VALUES(?,?,?,?,?,?,?,?,'held',?,?,?,?)",
-                (appointment_id, clinic_id, patient_id, plan_id, staff_id, kind, starts, ends, expires, key, actor_id, now))
+                "INSERT INTO appointments(id,clinic_id,patient_id,plan_id,staff_id,kind,service_code,service_quantity,"
+                "starts_at,ends_at,state,hold_expires_at,idempotency_key,created_by,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,'held',?,?,?,?)",
+                (appointment_id, clinic_id, patient_id, plan_id, staff_id, kind, service_code,
+                 service_quantity if service_code else 0, starts, ends, expires, key, actor_id, now))
             audit.append_event(connection, clinic_id=clinic_id, actor_id=actor_id, patient_id=patient_id,
                                aggregate_type="appointment", aggregate_id=appointment_id, action="appointment.held",
                                occurred_at=now, payload={"starts_at": starts, "ends_at": ends, "hold_expires_at": expires})
@@ -611,14 +625,28 @@ class Careflow:
                 raise Conflict("预约尚未到结束时间")
             version = appointment["version"] + 1
             connection.execute("UPDATE appointments SET state=?,version=? WHERE id=?", (after, version, appointment_id))
+            if action == "book":
+                held_entitlements = self.entitlements.hold_for_booking(
+                    connection, clinic_id, appointment, actor_id, now)
+            else:
+                held_entitlements = None
             if action == "start":
                 encounter_id = new_id("enc")
                 connection.execute("INSERT INTO encounters(id,appointment_id,patient_id,clinic_id,state,opened_by,opened_at) VALUES(?,?,?,?,'open',?,?)",
                                    (encounter_id, appointment_id, appointment["patient_id"], clinic_id, actor_id, now))
+            if action == "cancel":
+                self.entitlements.release_on_cancel(connection, clinic_id, appointment, actor_id, now, reason or "预约取消")
+            if action == "no_show":
+                self.entitlements.refer_on_no_show(connection, clinic_id, appointment, actor_id, now, reason or "患者未到诊")
             audit.append_event(connection, clinic_id=clinic_id, actor_id=actor_id, patient_id=appointment["patient_id"],
                                aggregate_type="appointment", aggregate_id=appointment_id, action=f"appointment.{action}",
-                               occurred_at=now, payload={"from": appointment["state"], "to": after, "reason": reason, "version": version})
-        return {"id": appointment_id, "state": after, "version": version, "updated_at": now}
+                               occurred_at=now, payload={"from": appointment["state"], "to": after, "reason": reason,
+                                                         "version": version,
+                                                         "entitlement_holds": held_entitlements or []})
+        result = {"id": appointment_id, "state": after, "version": version, "updated_at": now}
+        if held_entitlements is not None:
+            result["entitlement_holds"] = held_entitlements
+        return result
 
     def encounter_for_appointment(self, clinic_id: str, actor_id: str, appointment_id: str) -> dict[str, Any]:
         with self.db.transaction(write=False) as connection:
@@ -743,6 +771,7 @@ class Careflow:
                 (clinic_id, now, limit)).fetchall()
             for row in rows:
                 connection.execute("UPDATE appointments SET state='cancelled',version=version+1 WHERE id=? AND state='held'", (row["id"],))
+                self.entitlements.release_on_cancel(connection, clinic_id, row, None, now, "预约占位过期自动取消")
                 audit.append_event(connection, clinic_id=clinic_id, actor_id=None, patient_id=row["patient_id"],
                                    aggregate_type="appointment", aggregate_id=row["id"], action="appointment.hold_expired",
                                    occurred_at=now, payload={"hold_expires_at": row["hold_expires_at"]})

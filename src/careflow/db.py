@@ -11,7 +11,7 @@ from typing import Iterator
 
 from .errors import StorageFailure
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -162,6 +162,8 @@ CREATE TABLE IF NOT EXISTS appointments (
     plan_id TEXT REFERENCES plans(id),
     staff_id TEXT REFERENCES staff(id),
     kind TEXT NOT NULL,
+    service_code TEXT,
+    service_quantity INTEGER NOT NULL DEFAULT 1 CHECK(service_quantity>=0),
     starts_at TEXT NOT NULL,
     ends_at TEXT NOT NULL,
     state TEXT NOT NULL CHECK(state IN ('held','booked','arrived','in_service','completed','cancelled','no_show')),
@@ -247,6 +249,110 @@ CREATE TABLE IF NOT EXISTS lot_alerts (
     UNIQUE(lot_id,id)
 );
 CREATE INDEX IF NOT EXISTS lot_alerts_recent ON lot_alerts(lot_id,created_at DESC);
+CREATE TABLE IF NOT EXISTS service_catalog (
+    id TEXT PRIMARY KEY,
+    clinic_id TEXT NOT NULL REFERENCES clinics(id),
+    code TEXT NOT NULL,
+    name TEXT NOT NULL,
+    category TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+    rule_version TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(clinic_id,code)
+);
+CREATE TABLE IF NOT EXISTS entitlement_grants (
+    id TEXT PRIMARY KEY,
+    clinic_id TEXT NOT NULL REFERENCES clinics(id),
+    patient_id TEXT NOT NULL REFERENCES patients(id),
+    source TEXT NOT NULL CHECK(source IN ('purchase','gift','compensation','transfer_in','backfill')),
+    source_ref TEXT,
+    total_count INTEGER NOT NULL CHECK(total_count>0),
+    scope_json TEXT NOT NULL,
+    starts_on TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    rule_version TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('active','revoked','expired')),
+    granted_by TEXT NOT NULL REFERENCES staff(id),
+    reason TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expired_at TEXT,
+    version INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(clinic_id,idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS grants_patient ON entitlement_grants(patient_id,state,expires_at);
+CREATE TABLE IF NOT EXISTS entitlement_ledger (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    clinic_id TEXT NOT NULL REFERENCES clinics(id),
+    patient_id TEXT NOT NULL REFERENCES patients(id),
+    grant_id TEXT NOT NULL REFERENCES entitlement_grants(id),
+    entry_type TEXT NOT NULL CHECK(entry_type IN ('issue','hold','release','redeem','deduct','return','expire','reverse','review')),
+    count_delta INTEGER NOT NULL,
+    quantity INTEGER NOT NULL CHECK(quantity>=0),
+    hold_id TEXT,
+    appointment_id TEXT REFERENCES appointments(id),
+    encounter_id TEXT REFERENCES encounters(id),
+    review_id TEXT,
+    reversal_of INTEGER REFERENCES entitlement_ledger(sequence),
+    resolves_review TEXT REFERENCES entitlement_ledger(id),
+    reason TEXT NOT NULL,
+    actor_id TEXT REFERENCES staff(id),
+    idempotency_key TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(grant_id,idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS ledger_patient_sequence ON entitlement_ledger(patient_id,sequence);
+CREATE INDEX IF NOT EXISTS ledger_grant_sequence ON entitlement_ledger(grant_id,sequence);
+CREATE INDEX IF NOT EXISTS ledger_appointment ON entitlement_ledger(appointment_id);
+CREATE TABLE IF NOT EXISTS entitlement_holds (
+    id TEXT PRIMARY KEY,
+    clinic_id TEXT NOT NULL REFERENCES clinics(id),
+    patient_id TEXT NOT NULL REFERENCES patients(id),
+    grant_id TEXT NOT NULL REFERENCES entitlement_grants(id),
+    appointment_id TEXT NOT NULL REFERENCES appointments(id),
+    service_code TEXT NOT NULL,
+    quantity INTEGER NOT NULL CHECK(quantity>0),
+    state TEXT NOT NULL CHECK(state IN ('held','redeemed','partial_redeemed','released','deducted','in_review','reversed')),
+    held_by TEXT NOT NULL REFERENCES staff(id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS holds_appointment_state ON entitlement_holds(appointment_id,state);
+CREATE INDEX IF NOT EXISTS holds_grant ON entitlement_holds(grant_id);
+CREATE TABLE IF NOT EXISTS entitlement_adjustments (
+    id TEXT PRIMARY KEY,
+    clinic_id TEXT NOT NULL REFERENCES clinics(id),
+    patient_id TEXT NOT NULL REFERENCES patients(id),
+    kind TEXT NOT NULL CHECK(kind IN ('backfill','reversal')),
+    grant_id TEXT REFERENCES entitlement_grants(id),
+    ledger_sequence INTEGER REFERENCES entitlement_ledger(sequence),
+    quantity INTEGER NOT NULL CHECK(quantity>0),
+    reason TEXT NOT NULL,
+    evidence_ref TEXT,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    state TEXT NOT NULL CHECK(state IN ('pending','approved','rejected')),
+    requested_by TEXT NOT NULL REFERENCES staff(id),
+    reviewed_by TEXT REFERENCES staff(id),
+    review_note TEXT,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    reviewed_at TEXT,
+    version INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS adjustments_review ON entitlement_adjustments(state,created_at);
+CREATE TRIGGER IF NOT EXISTS entitlement_ledger_no_update
+BEFORE UPDATE ON entitlement_ledger
+BEGIN
+    SELECT RAISE(ABORT,'权益台账流水为不可变记录，只能追加');
+END;
+CREATE TRIGGER IF NOT EXISTS entitlement_ledger_no_delete
+BEFORE DELETE ON entitlement_ledger
+BEGIN
+    SELECT RAISE(ABORT,'权益台账流水为不可变记录，不能删除');
+END;
 CREATE TABLE IF NOT EXISTS encounters (
     id TEXT PRIMARY KEY,
     appointment_id TEXT NOT NULL UNIQUE REFERENCES appointments(id),
@@ -399,6 +505,7 @@ class Database:
         try:
             with self.session() as connection:
                 connection.executescript(SCHEMA)
+                self._migrate(connection)
                 connection.execute(
                     "INSERT INTO schema_meta(key,value) VALUES('schema_version',?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -406,6 +513,18 @@ class Database:
                 )
         except sqlite3.Error as exc:
             raise StorageFailure("数据库初始化失败", details={"reason": type(exc).__name__}) from exc
+
+    @staticmethod
+    def _column_exists(connection, table: str, column: str) -> bool:
+        return any(row[1] == column for row in connection.execute(f"PRAGMA table_info({table})").fetchall())
+
+    def _migrate(self, connection) -> None:
+        """对已存在的库做只增不改的结构升级；幂等可重复执行。"""
+        if not self._column_exists(connection, "appointments", "service_code"):
+            connection.execute("ALTER TABLE appointments ADD COLUMN service_code TEXT")
+        if not self._column_exists(connection, "appointments", "service_quantity"):
+            connection.execute(
+                "ALTER TABLE appointments ADD COLUMN service_quantity INTEGER NOT NULL DEFAULT 1 CHECK(service_quantity>=0)")
 
     @contextmanager
     def transaction(self, *, write: bool = True) -> Iterator[sqlite3.Connection]:
